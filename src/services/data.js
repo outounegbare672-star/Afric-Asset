@@ -16,17 +16,22 @@ const moduleConfig = {
 export function getModuleConfig(name) { return moduleConfig[name] }
 
 async function listSiteOverviews() {
-  const [{ data: sites, error: sitesError }, { data: locations, error: locationsError }, { data: movements, error: movementsError }, { data: assets, error: assetsError }] = await Promise.all([
+  const [{ data: sites, error: sitesError }, { data: locations, error: locationsError }, { data: movements, error: movementsError }, { data: assets, error: assetsError }, { data: assignments, error: assignmentsError }] = await Promise.all([
     supabase.from('sites').select('id, code, name, city, country').order('name'),
     supabase.from('locations').select('id, site_id'),
     supabase.from('stock_movements').select('location_id, asset_id, type, quantity, created_at'),
     supabase.from('assets').select('id, kind'),
+    supabase.from('site_assignments').select('site_id, profile_id').eq('is_active', true),
   ])
-  const error = sitesError || locationsError || movementsError || assetsError
+  const error = sitesError || locationsError || movementsError || assetsError || assignmentsError
   if (error) return { rows: [], error }
   const assetKinds = new Map((assets || []).map((asset) => [asset.id, asset.kind]))
   const locationSites = new Map((locations || []).map((location) => [location.id, location.site_id]))
-  const siteStats = new Map((sites || []).map((site) => [site.id, { ...site, stocks_available: 0, tools: new Set(), machines: new Set(), daily_consumption: 0 }]))
+  const siteStats = new Map((sites || []).map((site) => [site.id, { ...site, stocks_available: 0, tools: new Set(), machines: new Set(), personnel_assigned: 0, daily_consumption: 0 }]))
+  for (const assignment of assignments || []) {
+    const site = siteStats.get(assignment.site_id)
+    if (site) site.personnel_assigned += 1
+  }
   const dayStart = Date.now() - 24 * 60 * 60 * 1000
   const inbound = new Set(['receipt', 'transfer_in', 'return', 'adjustment'])
   const consumption = new Set(['issue', 'transfer_out', 'production_consumption'])
@@ -40,7 +45,7 @@ async function listSiteOverviews() {
     if (kind === 'tool') site.tools.add(movement.asset_id)
     if (kind === 'machine') site.machines.add(movement.asset_id)
   }
-  return { rows: [...siteStats.values()].map((site) => ({ ...site, stocks_available: Math.max(0, site.stocks_available), tools_present: site.tools.size, machines_present: site.machines.size, personnel_assigned: 'À affecter', daily_consumption: site.daily_consumption, tools: undefined, machines: undefined })), error: null }
+  return { rows: [...siteStats.values()].map((site) => ({ ...site, stocks_available: Math.max(0, site.stocks_available), tools_present: site.tools.size, machines_present: site.machines.size, personnel_assigned: site.personnel_assigned, daily_consumption: site.daily_consumption, tools: undefined, machines: undefined })), error: null }
 }
 
 export async function listModuleRows(name) {
