@@ -1,0 +1,52 @@
+create extension if not exists pgcrypto;
+create extension if not exists citext;
+
+do $$ begin create type public.app_role as enum ('admin','manager','storekeeper','driver','viewer'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.asset_kind as enum ('material','consumable','tool','equipment','machine'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.location_kind as enum ('site','store','warehouse'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.stock_movement_type as enum ('receipt','issue','transfer_in','transfer_out','adjustment','production_consumption','return'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.purchase_status as enum ('draft','submitted','approved','partially_received','received','cancelled'); exception when duplicate_object then null; end $$;
+
+create table if not exists public.organizations (id uuid primary key default gen_random_uuid(), name text not null, slug citext not null unique, created_at timestamptz not null default now(), updated_at timestamptz not null default now());
+create table if not exists public.profiles (id uuid primary key references auth.users(id) on delete cascade, organization_id uuid not null references public.organizations(id) on delete restrict, full_name text not null, email citext not null, role public.app_role not null default 'viewer', is_active boolean not null default true, created_at timestamptz not null default now(), updated_at timestamptz not null default now());
+create table if not exists public.sites (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, name text not null, code text not null, city text, country text not null default 'Togo', is_active boolean not null default true, created_at timestamptz not null default now(), unique (organization_id, code));
+create table if not exists public.locations (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, site_id uuid references public.sites(id) on delete restrict, name text not null, code text not null, kind public.location_kind not null, created_at timestamptz not null default now(), unique (organization_id, code));
+create table if not exists public.suppliers (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, name text not null, contact_name text, email citext, phone text, is_active boolean not null default true, created_at timestamptz not null default now());
+create table if not exists public.assets (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, sku text not null, name text not null, description text, kind public.asset_kind not null, category text, unit text not null, minimum_quantity numeric(18,3) not null default 0 check (minimum_quantity >= 0), unit_cost numeric(18,2) not null default 0 check (unit_cost >= 0), is_active boolean not null default true, created_at timestamptz not null default now(), updated_at timestamptz not null default now(), unique (organization_id, sku));
+create table if not exists public.stock_movements (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, asset_id uuid not null references public.assets(id) on delete restrict, location_id uuid not null references public.locations(id) on delete restrict, destination_location_id uuid references public.locations(id) on delete restrict, type public.stock_movement_type not null, quantity numeric(18,3) not null check (quantity > 0), unit_cost numeric(18,2) check (unit_cost >= 0), reference text, notes text, created_by uuid not null references public.profiles(id) on delete restrict, created_at timestamptz not null default now());
+create table if not exists public.purchases (id uuid primary key default gen_random_uuid(), organization_id uuid not null references public.organizations(id) on delete cascade, supplier_id uuid not null references public.suppliers(id) on delete restrict, destination_location_id uuid not null references public.locations(id) on delete restrict, number text not null, status public.purchase_status not null default 'draft', ordered_at date, expected_at date, total_amount numeric(18,2) not null default 0 check (total_amount >= 0), created_by uuid not null references public.profiles(id) on delete restrict, created_at timestamptz not null default now(), unique (organization_id, number));
+create table if not exists public.purchase_lines (id uuid primary key default gen_random_uuid(), purchase_id uuid not null references public.purchases(id) on delete cascade, asset_id uuid not null references public.assets(id) on delete restrict, quantity numeric(18,3) not null check (quantity > 0), unit_cost numeric(18,2) not null check (unit_cost >= 0), received_quantity numeric(18,3) not null default 0 check (received_quantity >= 0 and received_quantity <= quantity));
+create table if not exists public.audit_logs (id bigint generated always as identity primary key, organization_id uuid not null references public.organizations(id) on delete cascade, actor_id uuid references public.profiles(id) on delete set null, action text not null, entity_type text not null, entity_id uuid, metadata jsonb not null default '{}'::jsonb, created_at timestamptz not null default now());
+
+create index if not exists stock_movements_org_asset_idx on public.stock_movements(organization_id, asset_id, created_at desc);
+create index if not exists audit_logs_org_created_idx on public.audit_logs(organization_id, created_at desc);
+
+create or replace function public.current_organization_id() returns uuid language sql stable security definer set search_path = public as $$ select organization_id from public.profiles where id = auth.uid() and is_active = true $$;
+create or replace function public.has_role(required_roles public.app_role[]) returns boolean language sql stable security definer set search_path = public as $$ select exists (select 1 from public.profiles where id = auth.uid() and is_active = true and role = any(required_roles)) $$;
+
+create or replace function public.bootstrap_new_user() returns trigger language plpgsql security definer set search_path = public as $$
+declare new_org uuid; begin insert into public.organizations(name, slug) values (coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)) || ' Organisation', lower(replace(gen_random_uuid()::text, '-', ''))) returning id into new_org; insert into public.profiles(id, organization_id, full_name, email, role) values (new.id, new_org, coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email, '@', 1)), new.email, 'admin'); return new; end $$;
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.bootstrap_new_user();
+
+insert into public.organizations(name, slug)
+select coalesce(u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)) || ' Organisation', 'org-' || replace(u.id::text, '-', '')
+from auth.users u where not exists (select 1 from public.profiles p where p.id = u.id)
+on conflict (slug) do nothing;
+insert into public.profiles(id, organization_id, full_name, email, role)
+select u.id, o.id, coalesce(u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)), u.email, 'admin'
+from auth.users u join public.organizations o on o.slug = 'org-' || replace(u.id::text, '-', '')
+where not exists (select 1 from public.profiles p where p.id = u.id);
+
+do $$ declare t text; begin foreach t in array array['organizations','profiles','sites','locations','suppliers','assets','stock_movements','purchases','purchase_lines','audit_logs'] loop execute format('alter table public.%I enable row level security', t); end loop; end $$;
+create policy organizations_member_select on public.organizations for select using (id = public.current_organization_id());
+create policy profiles_same_org_select on public.profiles for select using (organization_id = public.current_organization_id());
+create policy sites_same_org_all on public.sites for all using (organization_id = public.current_organization_id() and public.has_role(array['admin','manager']::public.app_role[])) with check (organization_id = public.current_organization_id());
+create policy locations_same_org_all on public.locations for all using (organization_id = public.current_organization_id() and public.has_role(array['admin','manager']::public.app_role[])) with check (organization_id = public.current_organization_id());
+create policy suppliers_same_org_all on public.suppliers for all using (organization_id = public.current_organization_id() and public.has_role(array['admin','manager']::public.app_role[])) with check (organization_id = public.current_organization_id());
+create policy assets_same_org_all on public.assets for all using (organization_id = public.current_organization_id() and public.has_role(array['admin','manager','storekeeper']::public.app_role[])) with check (organization_id = public.current_organization_id());
+create policy movements_same_org_select on public.stock_movements for select using (organization_id = public.current_organization_id());
+create policy movements_storekeeper_insert on public.stock_movements for insert with check (organization_id = public.current_organization_id() and public.has_role(array['admin','manager','storekeeper']::public.app_role[]));
+create policy purchases_same_org_all on public.purchases for all using (organization_id = public.current_organization_id() and public.has_role(array['admin','manager']::public.app_role[])) with check (organization_id = public.current_organization_id());
+create policy purchase_lines_same_org_all on public.purchase_lines for all using (exists (select 1 from public.purchases p where p.id = purchase_id and p.organization_id = public.current_organization_id())) with check (exists (select 1 from public.purchases p where p.id = purchase_id and p.organization_id = public.current_organization_id()));
+create policy audit_same_org_select on public.audit_logs for select using (organization_id = public.current_organization_id());
