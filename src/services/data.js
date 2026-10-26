@@ -62,3 +62,35 @@ export async function createAsset(payload) {
 export async function createStockMovement(payload) {
   return supabase.from('stock_movements').insert(payload).select().single()
 }
+
+export async function getDashboardReport() {
+  const monthStart = new Date()
+  monthStart.setDate(1)
+  monthStart.setHours(0, 0, 0, 0)
+  const [{ count: assetCount, error: assetError }, { count: siteCount, error: siteError }, { count: movementCount, error: movementError }] = await Promise.all([
+    supabase.from('assets').select('id', { count: 'exact', head: true }).eq('is_active', true),
+    supabase.from('sites').select('id', { count: 'exact', head: true }).eq('is_active', true),
+    supabase.from('stock_movements').select('id', { count: 'exact', head: true }).gte('created_at', monthStart.toISOString()),
+  ])
+  return { data: { assetCount: assetCount || 0, siteCount: siteCount || 0, movementCount: movementCount || 0 }, error: assetError || siteError || movementError }
+}
+
+export async function askAssistantQuestion(question) {
+  const normalized = question.toLowerCase()
+  const kind = normalized.includes('outil') ? 'tool' : normalized.includes('engin') || normalized.includes('pelle') || normalized.includes('grue') ? 'machine' : null
+  const search = normalized.match(/ciment|sable|gravier|fer|marteau|meuleuse|perceuse|pelle|bulldozer|grue/)?.[0]
+  let query = supabase.from('assets').select('id, name, kind, unit').eq('is_active', true).limit(50)
+  if (kind) query = query.eq('kind', kind)
+  if (search) query = query.ilike('name', `%${search}%`)
+  const { data: assets, error: assetError } = await query
+  if (assetError) return { answer: '', error: assetError }
+  if (!assets?.length) return { answer: 'Aucun actif correspondant n’a été trouvé dans vos données Supabase.', error: null }
+  const ids = assets.map((asset) => asset.id)
+  const { data: movements, error: movementError } = await supabase.from('stock_movements').select('asset_id, type, quantity').in('asset_id', ids)
+  if (movementError) return { answer: '', error: movementError }
+  const inbound = new Set(['receipt', 'transfer_in', 'return', 'adjustment'])
+  const totals = new Map(assets.map((asset) => [asset.id, 0]))
+  for (const movement of movements || []) totals.set(movement.asset_id, (totals.get(movement.asset_id) || 0) + (inbound.has(movement.type) ? Number(movement.quantity) : -Number(movement.quantity)))
+  const result = assets.map((asset) => `${asset.name}: ${Math.max(0, totals.get(asset.id) || 0)} ${asset.unit}`).join(' · ')
+  return { answer: `Données actuelles : ${result}.`, error: null }
+}
